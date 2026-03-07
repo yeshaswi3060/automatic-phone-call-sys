@@ -1,0 +1,6 @@
+.env 
+platform-tools
+*.csv
+*.xlsx
+*.mp3
+*.zip
