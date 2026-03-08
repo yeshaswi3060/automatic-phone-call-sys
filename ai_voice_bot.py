@@ -30,6 +30,9 @@ openrouter_client = OpenAI(
 
 # Initialize Speech Recognition
 recognizer = sr.Recognizer()
+recognizer.energy_threshold = 150    # Massively increased sensitivity for quiet phone lines
+recognizer.dynamic_energy_threshold = True
+recognizer.pause_threshold = 1.0     # Gives the user 1 second to pause between words without cutting them off
 
 # Initialize Conversation History
 # We use Groq for the main conversation due to its speed
@@ -41,6 +44,19 @@ conversation_history = [
 # Options: "groq" or "openrouter"
 LLM_PROVIDER = "groq" 
 
+# Configure your AUX Microphone Input (Set inside main)
+MIC_INDEX = None
+
+def auto_detect_mic():
+    """Automatically finds the index of the Realtek AUX input."""
+    import speech_recognition as sr
+    devices = sr.Microphone.list_microphone_names()
+    for i, name in enumerate(devices):
+        # Based on user logs, this is the exact string that appears when plugged in
+        if "Realtek HD Audio Mic input" in name:
+            return i
+    return None
+
 
 # ==============================================================================
 # 2. CORE FUNCTIONS
@@ -48,31 +64,40 @@ LLM_PROVIDER = "groq"
 
 def listen_to_user():
     """Listens to the microphone and converts speech to text."""
-    with sr.Microphone() as source:
-        print("\n[AI] Listening...")
-        # Adjust for ambient noise
-        recognizer.adjust_for_ambient_noise(source, duration=0.5)
-        try:
-            # Listen for the user's voice
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
-            print("[AI] Processing speech...")
+    global MIC_INDEX
+    
+    try:
+        # We REMOVED sample_rate=44100 because forcing a rate can cause some 
+        # Realtek drivers to fail to connect to the stream (NoneType crash).
+        # We let the driver choose its own native rate.
+        with sr.Microphone(device_index=MIC_INDEX) as source:
+            print("\n[AI] Listening...")
+            # Minimal noise adjustment
+            recognizer.adjust_for_ambient_noise(source, duration=0.2)
             
-            # Use Google's free speech recognition (requires internet)
-            # You can also use Groq's Whisper API here if you want it faster/more accurate
-            # We set the language to Indian English which heavily accepts Hindi words (Hinglish)
-            text = recognizer.recognize_google(audio, language="en-IN")  
-            print(f"[USER SAYS]: {text}")
-            return text
-            
-        except sr.WaitTimeoutError:
-            print("[AI] (Silence...)")
-            return None
-        except sr.UnknownValueError:
-            print("[AI] (Didn't catch that...)")
-            return None
-        except sr.RequestError as e:
-            print(f"[AI] Could not request results; {e}")
-            return None
+            try:
+                # Listen for the user's voice
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
+                print("[AI] Processing speech...")
+                
+                # Use Google's speech recognition
+                text = recognizer.recognize_google(audio, language="en-IN")  
+                print(f"[USER SAYS]: {text}")
+                return text
+                
+            except sr.WaitTimeoutError:
+                return None
+            except sr.UnknownValueError:
+                return None
+            except Exception as e:
+                # If it's just a speech timeout/error, don't log it as critical
+                return None
+                
+    except Exception as e:
+        # This catches the 'NoneType' object error if the hardware fails to open
+        print(f"\n[AI] (Microphone Index {MIC_INDEX} is currently busy or unavailable. Retrying...)")
+        time.sleep(1)
+        return None
 
 
 def get_llm_response(user_text):
@@ -117,6 +142,9 @@ def get_llm_response(user_text):
         return "I'm sorry, I'm having trouble connecting to my brain right now."
 
 # Initialize Pygame Mixer for audio playback
+# Setting frequency to 44100Hz perfectly matches Edge-TTS output
+# This prevents audio stretching, static, or the "glittering" robotic artifacts!
+pygame.mixer.pre_init(44100, -16, 2, 2048)
 pygame.mixer.init()
 
 def speak(text):
@@ -140,7 +168,8 @@ def speak(text):
     
     # Edge-TTS is asynchronous, so we wrap it
     async def _generate_audio():
-        communicate = edge_tts.Communicate(text, voice, rate="+15%") # Speeds up the talk slightly
+        # Added MAX volume boost and returned rate to normal speed for less robotic pitch shifting
+        communicate = edge_tts.Communicate(text, voice, rate="+0%", volume="+100%") 
         await communicate.save(temp_audio_file)
 
     print("[AI] Generating voice...")
@@ -149,6 +178,7 @@ def speak(text):
     
     # Play the MP3 using Pygame
     pygame.mixer.music.load(temp_audio_file)
+    pygame.mixer.music.set_volume(1.0) # Force Pygame to play at maximum system volume
     pygame.mixer.music.play()
     
     # Wait until the audio is completely done playing before returning
@@ -184,25 +214,32 @@ def wait_for_pickup():
     # We will poll ADB every 2 seconds
     while True:
         try:
-            # dumpsys telecom contains the current state of all calls on the phone
+            # dumpsys telephony.registry is much more reliable for finding mCallState 
+            # 0 = IDLE (Disconnected), 1 = RINGING (Dialing/Incoming), 2 = OFFHOOK (Connected/Active)
             result = subprocess.run(
-                ["platform-tools\\adb.exe", "shell", "dumpsys", "telecom"],
-                capture_output=True, text=True, check=True
+                ["platform-tools\\adb.exe", "shell", "dumpsys", "telephony.registry"],
+                capture_output=True, text=True, errors="ignore", check=True
             )
             output = result.stdout
             
-            # If the call is actively connected, telecom dumpsys will show state: ACTIVE
-            if "state: ACTIVE" in output or "State: ACTIVE" in output:
-                print("\n[SYSTEM] Call has been PICKED UP! Starting AI...")
-                return True
+            # Find the FIRST occurrence of mCallState in the registry
+            state_lines = [line for line in output.split('\n') if 'mCallState' in line]
+            
+            if state_lines:
+                # E.g. "mCallState=2" or "  mCallState=2"
+                primary_state = state_lines[0].strip()
                 
-            # If the call was rejected, missed, or failed, it will disappear or show DISCONNECTED
-            if "state: DISCONNECTED" in output or "State: DISCONNECTED" in output:
-                print("\n[SYSTEM] Call was disconnected or rejected.")
-                return False
-                
+                if "mCallState=2" in primary_state:
+                    print("\n[SYSTEM] Call has been PICKED UP! Starting AI...")
+                    return True
+                    
+                # If we transition back from Dialing (1) to Idle (0) without hitting 2, they hung up / rejected
+                elif "mCallState=0" in primary_state:
+                    print("\n[SYSTEM] Call was disconnected or rejected.")
+                    return False
+        
         except subprocess.CalledProcessError:
-            pass # ADB might have glitched, just try again next loop
+            pass # ADB glitch, keep trying
             
         time.sleep(2)
 
@@ -214,8 +251,8 @@ def run_ai_conversation():
     print("Press Ctrl+C to stop.")
     print("="*50)
     
-    # Kick off the conversation
-    greeting = "Hello! I am your AI assistant. How can I help you today?"
+    # Kick off the conversation in Hindi
+    greeting = "नमस्ते! मैं आपकी एआई सहायक हूँ। मैं आज आपकी कैसे मदद कर सकती हूँ?"
     print(f"[AI SAYS]: {greeting}")
     speak(greeting)
     
@@ -239,10 +276,35 @@ def run_ai_conversation():
 
 
 def main():
+    global MIC_INDEX
+    
     # Make sure we actually found a key
     if not GROQ_API_KEY and LLM_PROVIDER == "groq":
         print("WARNING: You need to set your GROQ_API_KEY in the .env file!")
         return
+
+    # 1. Setup Microphone / AUX Port
+    print("="*50)
+    print("AUDIO SETUP: Detecting AUX Port...")
+    print("="*50)
+    
+    auto_mic = auto_detect_mic()
+    if auto_mic is not None:
+        MIC_INDEX = auto_mic
+        print(f"-> SUCCESS: Automatically linked to AUX Mic (Index {MIC_INDEX})")
+    else:
+        print("-> WARNING: Could not auto-detect AUX cable. Fallback to manual selection:")
+        for index, name in enumerate(sr.Microphone.list_microphone_names()):
+            print(f"Device [{index}]: {name}")
+        print("-"*50)
+        mic_choice = input("Enter the Device Index of your AUX Phone Cable (or just press Enter for default): ")
+        if mic_choice.strip():
+            MIC_INDEX = int(mic_choice.strip())
+            print(f"-> Set AI Microphone to Index {MIC_INDEX}")
+        else:
+            print("-> Using default system microphone.")
+        
+    print("\n")
 
     # You can test the AI locally without making a phone call first
     test_mode = input("Do you want to run purely in Test Mode (no phone call)? (y/n): ")
